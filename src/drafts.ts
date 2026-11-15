@@ -12,7 +12,7 @@ export type DraftEdit = {
   font: FontChoice | null
   layout: LayoutChoice | null
   layout_reference?: string
-  layout_refresh_available?: boolean
+  preparation_refresh_available?: boolean
   orientation?: TextOrientation
   texture?: boolean
   texture_status?: TextureStatus | null

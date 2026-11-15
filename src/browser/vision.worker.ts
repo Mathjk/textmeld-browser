@@ -1,8 +1,10 @@
 import cv from '@techstark/opencv-js'
 import type { InferenceSession } from 'onnxruntime-web/wasm'
 import type { Box, Letter, Output, Prepared, RenderOptions, Typeface, WorkerActions } from './types'
+import { inkRevision } from './types'
 import type { TextOrientation } from '../drafts'
 import { hanReference, measuredSlots, protectBoundaryPunctuation, usesOriginalPositions } from './spacing'
+import { followsInk, foregroundColor, rebuildSmoothBackground } from './ink'
 
 type Point = { x: number; y: number }
 type Quad = [Point, Point, Point, Point]
@@ -264,94 +266,180 @@ function hits(mask: cv.Mat, quad: Quad) {
 }
 
 function flatBackground(plane: cv.Mat, smoothed: cv.Mat, allowed: Uint8Array) {
+  const pixels = plane.data
+  const filtered = smoothed.data
   const histogram = new Uint32Array(32768)
   for (let n = 0; n < allowed.length; n++) {
-    if (!allowed[n] || plane.data[4 * n + 3] < 200) continue
-    const index = ((plane.data[4 * n] >> 3) << 10) | ((plane.data[4 * n + 1] >> 3) << 5) | (plane.data[4 * n + 2] >> 3)
+    if (!allowed[n] || pixels[4 * n + 3] < 200) continue
+    const index = ((pixels[4 * n] >> 3) << 10) | ((pixels[4 * n + 1] >> 3) << 5) | (pixels[4 * n + 2] >> 3)
     histogram[index]++
   }
   let best = 0
   for (let n = 1; n < histogram.length; n++) if (histogram[n] > histogram[best]) best = n
   const color = [(best >> 10) * 8 + 4, ((best >> 5) & 31) * 8 + 4, (best & 31) * 8 + 4]
-  let checked = 0, near = 0
+  let checked = 0, near = 0, unfiltered = 0
+  const edges = [{ checked: 0, near: 0 }, { checked: 0, near: 0 }]
+  const band = Math.max(2, Math.min(5, Math.floor(plane.rows * 0.12)))
   for (let n = 0; n < allowed.length; n++) {
-    if (!allowed[n] || plane.data[4 * n + 3] < 200) continue
+    if (!allowed[n] || pixels[4 * n + 3] < 200) continue
     checked++
-    if (color.every((value, c) => Math.abs(smoothed.data[4 * n + c] - value) <= 18)) near++
+    if (color.every((value, c) => Math.abs(filtered[4 * n + c] - value) <= 18)) near++
+    const nearColor = color.every((value, c) => Math.abs(pixels[4 * n + c] - value) <= 14)
+    if (nearColor) unfiltered++
+    const y = Math.floor(n / plane.cols)
+    const edge = y < band ? edges[0] : y >= plane.rows - band ? edges[1] : undefined
+    if (edge) {
+      edge.checked++
+      if (nearColor) edge.near++
+    }
   }
-  return checked && near / checked >= 0.88 ? color : undefined
+  if (checked && near / checked >= 0.88) return color
+  // Thick strokes can dominate the median filter. Independently verify the two margins of the line.
+  if (unfiltered >= checked * 0.5 && edges.every((edge) => edge.checked >= 20 && edge.near >= edge.checked * 0.94)) return color
 }
 
-function inkFrom(plane: cv.Mat, allowed: Uint8Array) {
-  const { cols: width, rows: height } = plane
-  const base = new cv.Mat()
-  const window = Math.min(41, Math.max(5, Math.round(Math.min(width, height) * 0.46) | 1))
-  cv.medianBlur(plane, base, window)
-  const uniform = flatBackground(plane, base, allowed)
-  const differences = new Float32Array(width * height)
-  const histogram = new Uint32Array(256)
-  let count = 0
-  for (let n = 0; n < differences.length; n++) {
-    if (!allowed[n] || plane.data[4 * n + 3] < 200) continue
-    let delta = 0
-    for (let channel = 0; channel < 3; channel++) {
-      const background = uniform?.[channel] ?? base.data[4 * n + channel]
-      delta += (plane.data[4 * n + channel] - background) ** 2
-    }
-    differences[n] = Math.sqrt(delta / 3)
-    histogram[Math.min(255, Math.round(differences[n]))]++
-    count++
+function dilateMask(mask: Uint8Array, width: number, height: number, size: number) {
+  const source = cv.matFromArray(height, width, cv.CV_8UC1, mask)
+  const expanded = new cv.Mat()
+  const kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(size, size))
+  try {
+    cv.dilate(source, expanded, kernel)
+    return Uint8Array.from(expanded.data)
+  } finally {
+    source.delete(); expanded.delete(); kernel.delete()
   }
-  base.delete()
-  let tail = 0, contrast = 0
-  for (let n = 255; n >= 0; n--) {
-    tail += histogram[n]
-    if (tail >= count * 0.08) { contrast = n; break }
-  }
-  if (contrast < 6) throw new Error('原字与底图对比度太低，请缩小选区。')
-  const core = Uint8Array.from(differences, (delta) => delta >= Math.max(5, contrast * 0.36) ? 255 : 0)
+}
+
+function dropSmallComponents(core: Uint8Array, width: number, height: number) {
   const labels = new cv.Mat(), stats = new cv.Mat(), centroids = new cv.Mat()
   const coreMat = cv.matFromArray(height, width, cv.CV_8UC1, core)
   try {
     const groups = cv.connectedComponentsWithStats(coreMat, labels, stats, centroids, 8, cv.CV_32S)
     let largest = 0
     for (let n = 1; n < groups; n++) largest = Math.max(largest, stats.intAt(n, cv.CC_STAT_AREA))
-    const rgb = [[], [], []] as number[][]
-    let weak = 0, solid = 0
+    const components = labels.data32S
     for (let n = 0; n < core.length; n++) {
-      const label = labels.data32S[n]
-      if (!label || stats.intAt(label, cv.CC_STAT_AREA) < Math.max(2, largest * 0.025)) {
-        core[n] = 0
-        continue
-      }
-      if (differences[n] >= contrast * 1.1) for (let c = 0; c < 3; c++) rgb[c].push(plane.data[4 * n + c])
-      if (differences[n] < contrast * 0.62) weak++
-      else solid++
-    }
-    const ink = bounding(core, width, height)
-    const color = rgb.map((channel) => {
-      channel.sort((a, b) => a - b)
-      return channel[Math.floor(channel.length / 2)] ?? 45
-    })
-    const inkMat = cv.matFromArray(height, width, cv.CV_8UC1, core)
-    const expanded = new cv.Mat()
-    const kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(3, 3))
-    try {
-      cv.dilate(inkMat, expanded, kernel)
-      const erase = Uint8Array.from(expanded.data, (pixel, n) => allowed[n] ? pixel : 0)
-      return { ink, core, color, erase, softness: Math.min(1, weak / Math.max(1, solid)) }
-    } finally {
-      inkMat.delete(); expanded.delete(); kernel.delete()
+      const label = components[n]
+      if (!label || stats.intAt(label, cv.CC_STAT_AREA) < Math.max(2, largest * 0.025)) core[n] = 0
     }
   } finally {
     coreMat.delete(); labels.delete(); stats.delete(); centroids.delete()
   }
 }
 
+function inkFrom(plane: cv.Mat, allowed: Uint8Array) {
+  const { cols: width, rows: height } = plane
+  const base = new cv.Mat()
+  const window = Math.min(41, Math.max(5, Math.round(Math.min(width, height) * 0.46) | 1))
+  try {
+    cv.medianBlur(plane, base, window)
+    const uniform = flatBackground(plane, base, allowed)
+    const differences = new Float32Array(width * height)
+    const histogram = new Uint32Array(256)
+    const pixels = plane.data
+    const smoothed = base.data
+    let count = 0
+    for (let n = 0; n < differences.length; n++) {
+      if (!allowed[n] || pixels[4 * n + 3] < 200) continue
+      let delta = 0
+      for (let channel = 0; channel < 3; channel++) {
+        const background = uniform?.[channel] ?? smoothed[4 * n + channel]
+        delta += (pixels[4 * n + channel] - background) ** 2
+      }
+      differences[n] = Math.sqrt(delta / 3)
+      histogram[Math.min(255, Math.round(differences[n]))]++
+      count++
+    }
+    let tail = 0, contrast = 0
+    for (let n = 255; n >= 0; n--) {
+      tail += histogram[n]
+      if (tail >= count * 0.08) { contrast = n; break }
+    }
+    if (contrast < 6 || !count) throw new Error('原字与底图对比度太低，请缩小选区。')
+    const core = Uint8Array.from(differences, (delta) => delta >= Math.max(5, contrast * 0.36) ? 255 : 0)
+    dropSmallComponents(core, width, height)
+    let weak = 0, solid = 0
+    for (let n = 0; n < core.length; n++) {
+      if (!core[n]) continue
+      if (differences[n] < contrast * 0.62) weak++
+      else solid++
+    }
+    const ink = bounding(core, width, height)
+    const color = foregroundColor(plane.data, core, differences)
+    const nearby = dilateMask(core, width, height, 5)
+    const strokeRadius = Math.min(7, Math.max(3, Math.ceil(Math.min(ink.width, ink.height) / 5)))
+    const thickStrokeArea = uniform ? undefined : dilateMask(core, width, height, 2 * strokeRadius + 1)
+    const working = plane.data
+    const background = base.data
+    const halo = core.slice()
+    const faint = Math.max(2.5, contrast * 0.075)
+    for (let n = 0; n < halo.length; n++) {
+      if (halo[n] || !allowed[n] || working[4 * n + 3] < 200) continue
+      const faintStroke = nearby[n] && differences[n] >= faint && followsInk(working, background, uniform, n * 4, color)
+      const denseStroke = thickStrokeArea?.[n] && color.every((value, c) => Math.abs(working[4 * n + c] - value) <= 10)
+      if (faintStroke || denseStroke) halo[n] = 255
+    }
+    const erase = dilateMask(halo, width, height, 3).map((pixel, n) => allowed[n] ? pixel : 0)
+    return { ink, core, color, erase, uniform, softness: Math.min(1, weak / Math.max(1, solid)) }
+  } finally {
+    base.delete()
+  }
+}
+
+async function repairBackground(flat: cv.Mat, mask: Uint8Array, uniform: number[] | undefined) {
+  const { cols: width, rows: height } = flat
+  const nearby = dilateMask(mask, width, height, 9)
+  const smooth = rebuildSmoothBackground(flat.data, mask, nearby, width, height, uniform)
+  if (smooth) return surfaceFrom(smooth, width, height).image.convertToBlob()
+  const rgb = new cv.Mat(), filled = new cv.Mat(), restored = new cv.Mat()
+  const erase = cv.matFromArray(height, width, cv.CV_8UC1, mask)
+  try {
+    cv.cvtColor(flat, rgb, cv.COLOR_RGBA2RGB)
+    cv.inpaint(rgb, erase, filled, 3, cv.INPAINT_TELEA)
+    cv.cvtColor(filled, restored, cv.COLOR_RGB2RGBA)
+    return await surfaceFrom(restored.data, width, height).image.convertToBlob()
+  } finally {
+    rgb.delete(); filled.delete(); restored.delete(); erase.delete()
+  }
+}
 function bitCount(value: number) {
   let count = 0
   while (value) { value &= value - 1; count++ }
   return count
+}
+
+function nativeForeground(source: cv.Mat, transform: number[], width: number, height: number,
+  extracted: ReturnType<typeof inkFrom>) {
+  const core = cv.matFromArray(height, width, cv.CV_8UC1, extracted.core)
+  const projected = warp(core, transform, source.cols, source.rows, cv.INTER_NEAREST)
+  const smoothed = new cv.Mat()
+  try {
+    const { uniform, color, ink } = extracted
+    if (!uniform) {
+      const window = Math.min(41, Math.max(5, Math.round(Math.min(ink.width, ink.height) * 0.46) | 1))
+      cv.medianBlur(source, smoothed, window)
+    }
+    const pixels = source.data
+    const background = uniform ? pixels : smoothed.data
+    const mask = projected.data
+    const differences = new Float32Array(mask.length)
+    let count = 0
+    for (let n = 0; n < mask.length; n++) {
+      const p = n * 4
+      if (!mask[n]) continue
+      if (pixels[p + 3] < 245 || !followsInk(pixels, background, uniform, p, color)) {
+        mask[n] = 0
+        continue
+      }
+      let difference = 0
+      for (let c = 0; c < 3; c++) difference += (pixels[p + c] - (uniform?.[c] ?? background[p + c])) ** 2
+      differences[n] = Math.sqrt(difference / 3)
+      count++
+    }
+    return count >= 12 ? foregroundColor(pixels, mask, differences, 0.9) : color
+  } finally {
+    core.delete(); projected.delete(); smoothed.delete()
+  }
 }
 
 function recommend(letters: Letter[], ink: Uint8Array, width: number, height: number, vertical: boolean) {
@@ -492,21 +580,12 @@ async function prepare({ image, mask, orientation }: WorkerActions['prepare']): 
       extracted.ink = bounding(extracted.core, plane.width, plane.height)
     }
     const glyphSlots = vertical ? [] : measuredSlots(letters, extracted.core, plane.width, plane.height, extracted.ink.height)
-    const rgb = new cv.Mat(), filled = new cv.Mat(), restored = new cv.Mat()
-    const erase = cv.matFromArray(plane.height, plane.width, cv.CV_8UC1, extracted.erase)
-    let background: Blob
-    try {
-      cv.cvtColor(flat, rgb, cv.COLOR_RGBA2RGB)
-      cv.inpaint(rgb, erase, filled, 3, cv.INPAINT_TELEA)
-      cv.cvtColor(filled, restored, cv.COLOR_RGB2RGBA)
-      background = await surfaceFrom(restored.data, plane.width, plane.height).image.convertToBlob()
-    } finally {
-      rgb.delete(); filled.delete(); restored.delete(); erase.delete()
-    }
+    const foreground = nativeForeground(color, matrix(dst, quad), plane.width, plane.height, extracted)
+    const background = await repairBackground(flat, extracted.erase, extracted.uniform)
     const physical = quad.map((p) => orientation === 'clockwise' ? { x: crop.width - p.y, y: p.x }
       : orientation === 'counterclockwise' ? { x: p.y, y: crop.height - p.x } : p) as Quad
     return { crop, originalImage, background, erase: extracted.erase, matrix: matrix(dst, physical), plane,
-      ink: extracted.ink, color: extracted.color, original, letters, glyphSlots, orientation,
+      ink: extracted.ink, color: foreground, original, letters, glyphSlots, inkRevision, orientation,
       candidates: recommend(letters, extracted.core, plane.width, plane.height, vertical), softness: extracted.softness }
   } finally {
     color.delete(); allowed.delete(); flat?.delete(); flatMask?.delete()

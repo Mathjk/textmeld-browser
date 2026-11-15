@@ -132,7 +132,7 @@ export default function App() {
   const missingPreview = draftsEnabled && Boolean(draft?.result_url) && !resultUrl
   const canSubmit = Boolean(health && modelsReady && image && marks.length && text.trim() && textCount <= limits.max_text && !locked && !scanning && !addingFont && (!missingPreview || pending) &&
     (!draftsEnabled || !draftId || draft))
-  const matchesAppliedEdit = Boolean(resultUrl && activeEdit && useSavedSelection && !activeEdit.layout_refresh_available &&
+  const matchesAppliedEdit = Boolean(resultUrl && activeEdit && useSavedSelection && !activeEdit.preparation_refresh_available &&
     activeEdit.text === text.trim() && activeEdit.font?.family === font?.family && activeEdit.font?.weight === font?.weight &&
     (activeEdit.layout?.spacing ?? 0) === (layout?.spacing ?? 0) && activeEdit.layout?.mode === layout?.mode &&
     Boolean(activeEdit.texture) === texture &&

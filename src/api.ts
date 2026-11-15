@@ -56,7 +56,7 @@ export class RequestError extends Error {
 
 export async function getHealth(signal: AbortSignal): Promise<Health> {
   signal.throwIfAborted()
-  return { status: 'ok', mode: 'local', limits: defaultLimits, drafts: true, typography: true, version: '1.4.1',
+  return { status: 'ok', mode: 'local', limits: defaultLimits, drafts: true, typography: true, version: '1.4.2',
     providers: { defaults: { ocr: 'local', inpaint: 'local', render: 'pillow' },
       available: { ocr: ['local'], inpaint: ['local'], render: ['pillow', 'pillow-sans', 'pillow-serif'] }, has_custom_font: false } }
 }

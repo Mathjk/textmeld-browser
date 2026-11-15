@@ -6,8 +6,9 @@ import { makeMask } from '../image'
 import { getFontCatalog, imageBase64, namedCandidates, typeface } from './fonts'
 import { vision } from './runtime'
 import { change, read } from './storage'
-import { hanReference, usesOriginalPositions } from './spacing'
+import { hanReference } from './spacing'
 import type { Box, Output, Prepared } from './types'
+import { inkRevision } from './types'
 
 type Edit = { view: DraftEdit; prepared: Prepared; patch: Blob }
 type StoredDraft = { id: string; version: number; source: SourceImage; edits: Edit[]; operation: string | null; selected: string | null }
@@ -21,7 +22,7 @@ function view(record: StoredDraft): Draft {
   return {
     draft_id: record.id, version: record.version, edits: record.edits.map((edit) => ({
       ...edit.view,
-      layout_refresh_available: needsNewPositions(edit, edit.view.text),
+      preparation_refresh_available: edit.prepared.inkRevision !== inkRevision,
     })),
     pending_task_id: active?.id ?? null, pending_operation_id: active?.operation ?? null,
     last_operation_id: record.operation, last_edit_id: record.selected,
@@ -126,13 +127,8 @@ function options(text: string, style: TextStyle, provider: ProviderSelection = d
   }))
 }
 
-function needsNewPositions(edit: Edit, text: string) {
-  return edit.prepared.glyphSlots === undefined && edit.prepared.orientation !== 'vertical' &&
-    usesOriginalPositions(edit.prepared.original, text)
-}
-
-async function refreshPositions(record: StoredDraft, edit: Edit, text: string, signal: AbortSignal) {
-  if (!needsNewPositions(edit, text)) return edit.prepared
+async function prepareSavedEdit(record: StoredDraft, edit: Edit, signal: AbortSignal) {
+  if (edit.prepared.inkRevision === inkRevision) return edit.prepared
   const { marks } = edit.view
   const mask = await makeMask(record.source, marks, defaultLimits)
   return prepare(record.source.blob, marks, mask, edit.prepared.orientation, signal)
@@ -163,7 +159,7 @@ export async function applyEdit(draft: Draft, operationId: string, editId: strin
       update({ status: 'processing', stage: mask ? 'ocr' : 'render', progress: 0.15 })
       const orientation = style.orientation ?? 'horizontal'
       const prepared = mask ? await prepare(snapshot.source.blob, marks, mask, orientation, signal)
-        : before && await refreshPositions(snapshot, before, text, signal)
+        : before && await prepareSavedEdit(snapshot, before, signal)
       if (!prepared) throw new Error('请重新框选图片文字。')
       update({ stage: 'render', progress: 0.74 })
       const renderOptions = await options(text, style, provider)
@@ -211,16 +207,16 @@ export async function removeDraft(draft: Draft) {
   })
 }
 
-async function preparedForPreview(draftId: string, editId: string, text: string, signal: AbortSignal) {
+async function preparedForPreview(draftId: string, editId: string, signal: AbortSignal) {
   const record = await stored(draftId)
   const found = record.edits.find((item) => item.view.id === editId)
   if (!found) throw new RequestError('无法读取此处的背景。', 404)
-  return refreshPositions(record, found, text, signal)
+  return prepareSavedEdit(record, found, signal)
 }
 
 export async function previewFonts(draftId: string, editId: string, text: string, signal: AbortSignal,
   font?: FontChoice, layout?: TextStyle['layout'], texture?: boolean): Promise<FontPreviews> {
-  const prepared = await preparedForPreview(draftId, editId, text, signal)
+  const prepared = await preparedForPreview(draftId, editId, signal)
   const catalog = await getFontCatalog(text)
   const matching = catalog.fonts.filter(({ id }) => prepared.candidates.includes(id) || id.startsWith('system-')).slice(0, 3)
   const faces = font ? catalog.fonts.filter(({ id }) => id === font.family) : matching
@@ -237,7 +233,7 @@ export async function previewFonts(draftId: string, editId: string, text: string
 
 export async function previewTexture(draftId: string, editId: string, text: string, style: TextStyle,
   provider: ProviderSelection | undefined, signal: AbortSignal): Promise<TexturePreview> {
-  const prepared = await preparedForPreview(draftId, editId, text, signal)
+  const prepared = await preparedForPreview(draftId, editId, signal)
   const renderOptions = await options(text, style, provider)
   const normal = await vision<Output>('render', { prepared, options: { ...renderOptions, texture: false } }, signal)
   const matched = await vision<Output>('render', { prepared, options: { ...renderOptions, texture: true } }, signal)

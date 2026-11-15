@@ -1,5 +1,7 @@
 import type { TextOrientation } from '../drafts'
 
+export const inkRevision = 2
+
 export type Box = { x: number; y: number; width: number; height: number }
 export type Letter = { text: string; position: number; left: number; right: number }
 export type GlyphSlot = { left: number; right: number }
@@ -15,6 +17,7 @@ export type Prepared = {
   original: string
   letters: Letter[]
   glyphSlots?: GlyphSlot[]
+  inkRevision?: number
   orientation: TextOrientation
   candidates: string[]
   softness: number

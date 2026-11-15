@@ -49,7 +49,9 @@ export function protectBoundaryPunctuation(
     }
     if (!total || selected / total >= 0.55) continue
     protectedPunctuation = true
-    for (let y = 0; y < height; y++) for (let x = Math.max(0, left - 1); x < Math.min(width, right + 1); x++) {
+    const leftLimit = index ? Math.ceil((bands[index - 1].right + left) / 2) : 0
+    const rightLimit = index + 1 < bands.length ? Math.floor((right + bands[index + 1].left) / 2) : width
+    for (let y = 0; y < height; y++) for (let x = Math.max(leftLimit, left - 3); x < Math.min(rightLimit, right + 3); x++) {
       core[y * width + x] = 0
       erase[y * width + x] = 0
     }

@@ -1,5 +1,5 @@
 const root = new URL('./', self.registration.scope)
-const cacheName = 'textmeld-browser-shell-v1.4.1-' + root.pathname
+const cacheName = 'textmeld-browser-shell-v1.4.2-' + root.pathname
 const url = (file) => new URL(file, root).href
 
 self.addEventListener('install', (event) => {

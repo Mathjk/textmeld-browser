@@ -20,7 +20,7 @@ export type DraftEdit = {
 }
 
 export type FontChoice = { family: string; weight: number }
-export type LayoutChoice = { spacing: number }
+export type LayoutChoice = { spacing: number; mode?: 'natural' }
 export type TextOrientation = 'horizontal' | 'vertical' | 'clockwise' | 'counterclockwise'
 export type TextureStatus = 'applied' | 'similar' | 'unchanged'
 export type TexturePreview = { original: string; normal: string; matched: string; status: TextureStatus }

@@ -1,10 +1,12 @@
 import type { Task, ProviderSelection } from '../api'
-import { RequestError } from '../api'
+import { RequestError, defaultLimits } from '../api'
 import type { Draft, DraftEdit, FontChoice, FontPreviews, TextStyle, TexturePreview } from '../drafts'
 import type { Mark, SourceImage } from '../image'
+import { makeMask } from '../image'
 import { getFontCatalog, imageBase64, namedCandidates, typeface } from './fonts'
 import { vision } from './runtime'
 import { change, read } from './storage'
+import { hanReference, usesOriginalPositions } from './spacing'
 import type { Box, Output, Prepared } from './types'
 
 type Edit = { view: DraftEdit; prepared: Prepared; patch: Blob }
@@ -17,7 +19,10 @@ let proposed: { image: Blob; key: string; prepared: Promise<Prepared> } | undefi
 function view(record: StoredDraft): Draft {
   const active = running.get(record.id)
   return {
-    draft_id: record.id, version: record.version, edits: record.edits.map((edit) => edit.view),
+    draft_id: record.id, version: record.version, edits: record.edits.map((edit) => ({
+      ...edit.view,
+      layout_refresh_available: needsNewPositions(edit, edit.view.text),
+    })),
     pending_task_id: active?.id ?? null, pending_operation_id: active?.operation ?? null,
     last_operation_id: record.operation, last_edit_id: record.selected,
     result_url: record.edits.length ? 'browser:' + record.id + '/' + record.version : null,
@@ -117,8 +122,20 @@ async function overlap(original: Edit, next: Edit) {
 
 function options(text: string, style: TextStyle, provider: ProviderSelection = defaults) {
   return typeface(style.font, text, provider.render === 'pillow-serif').then((font) => ({
-    text, font, texture: style.texture, spacing: style.layout?.spacing,
+    text, font, texture: style.texture, spacing: style.layout?.mode === 'natural' ? undefined : style.layout?.spacing ?? 0,
   }))
+}
+
+function needsNewPositions(edit: Edit, text: string) {
+  return edit.prepared.glyphSlots === undefined && edit.prepared.orientation !== 'vertical' &&
+    usesOriginalPositions(edit.prepared.original, text)
+}
+
+async function refreshPositions(record: StoredDraft, edit: Edit, text: string, signal: AbortSignal) {
+  if (!needsNewPositions(edit, text)) return edit.prepared
+  const { marks } = edit.view
+  const mask = await makeMask(record.source, marks, defaultLimits)
+  return prepare(record.source.blob, marks, mask, edit.prepared.orientation, signal)
 }
 
 export async function applyEdit(draft: Draft, operationId: string, editId: string | undefined, marks: Mark[], text: string,
@@ -145,7 +162,8 @@ export async function applyEdit(draft: Draft, operationId: string, editId: strin
       const before = snapshot.edits.find((item) => item.view.id === nextId)
       update({ status: 'processing', stage: mask ? 'ocr' : 'render', progress: 0.15 })
       const orientation = style.orientation ?? 'horizontal'
-      const prepared = mask ? await prepare(snapshot.source.blob, marks, mask, orientation, signal) : before?.prepared
+      const prepared = mask ? await prepare(snapshot.source.blob, marks, mask, orientation, signal)
+        : before && await refreshPositions(snapshot, before, text, signal)
       if (!prepared) throw new Error('请重新框选图片文字。')
       update({ stage: 'render', progress: 0.74 })
       const renderOptions = await options(text, style, provider)
@@ -153,8 +171,9 @@ export async function applyEdit(draft: Draft, operationId: string, editId: strin
       const next: Edit = { prepared, patch: result.patch, view: {
         id: nextId, text, marks, original: prepared.original, mode: 'local', providers: provider ?? defaults, state: 'applied',
         font: style.font ?? null, layout: style.layout ?? null, orientation, texture: style.texture,
-        texture_status: style.texture ? (result.softened ? 'applied' : 'unchanged') : null, reused_background: !mask,
-        layout_reference: prepared.original.replace(/[\p{P}]+$/u, ''),
+        texture_status: style.texture ? (result.softened ? 'applied' : 'unchanged') : null,
+        reused_background: !mask && prepared === before?.prepared,
+        layout_reference: hanReference(prepared.original) ?? prepared.original,
       } }
       for (const other of snapshot.edits) {
         if (other.view.id !== nextId && await overlap(other, next)) throw new Error('该处与已有改动重叠，请调整选区。')
@@ -192,16 +211,16 @@ export async function removeDraft(draft: Draft) {
   })
 }
 
-async function getEdit(draftId: string, editId: string) {
-  const found = (await stored(draftId)).edits.find((item) => item.view.id === editId)
+async function preparedForPreview(draftId: string, editId: string, text: string, signal: AbortSignal) {
+  const record = await stored(draftId)
+  const found = record.edits.find((item) => item.view.id === editId)
   if (!found) throw new RequestError('无法读取此处的背景。', 404)
-  return found
+  return refreshPositions(record, found, text, signal)
 }
 
 export async function previewFonts(draftId: string, editId: string, text: string, signal: AbortSignal,
   font?: FontChoice, layout?: TextStyle['layout'], texture?: boolean): Promise<FontPreviews> {
-  const edit = await getEdit(draftId, editId)
-  const prepared = edit.prepared
+  const prepared = await preparedForPreview(draftId, editId, text, signal)
   const catalog = await getFontCatalog(text)
   const matching = catalog.fonts.filter(({ id }) => prepared.candidates.includes(id) || id.startsWith('system-')).slice(0, 3)
   const faces = font ? catalog.fonts.filter(({ id }) => id === font.family) : matching
@@ -218,7 +237,7 @@ export async function previewFonts(draftId: string, editId: string, text: string
 
 export async function previewTexture(draftId: string, editId: string, text: string, style: TextStyle,
   provider: ProviderSelection | undefined, signal: AbortSignal): Promise<TexturePreview> {
-  const { prepared } = await getEdit(draftId, editId)
+  const prepared = await preparedForPreview(draftId, editId, text, signal)
   const renderOptions = await options(text, style, provider)
   const normal = await vision<Output>('render', { prepared, options: { ...renderOptions, texture: false } }, signal)
   const matched = await vision<Output>('render', { prepared, options: { ...renderOptions, texture: true } }, signal)

@@ -2,6 +2,7 @@ import type { TextOrientation } from '../drafts'
 
 export type Box = { x: number; y: number; width: number; height: number }
 export type Letter = { text: string; position: number; left: number; right: number }
+export type GlyphSlot = { left: number; right: number }
 export type Prepared = {
   crop: Box
   originalImage: Blob
@@ -13,6 +14,7 @@ export type Prepared = {
   color: number[]
   original: string
   letters: Letter[]
+  glyphSlots?: GlyphSlot[]
   orientation: TextOrientation
   candidates: string[]
   softness: number

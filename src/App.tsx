@@ -10,6 +10,7 @@ import Icon from './Icon'
 import FontMatching from './FontMatching'
 import ImageStage from './ImageStage'
 import BrowserSetup from './BrowserSetup'
+import { usesOriginalPositions } from './browser/spacing'
 import TextureControls, { textureStatus } from './TextureControls'
 import ProviderSettings, { availableProviders, readProviders, rememberProviders } from './ProviderSettings'
 import './styles.css'
@@ -48,11 +49,6 @@ function reopenError(error: unknown) {
 
 function sameMarks(a: Mark[], b: Mark[]) {
   return a === b || JSON.stringify(a) === JSON.stringify(b)
-}
-
-function fullWidthChinese(text: string) {
-  const chars = Array.from(text)
-  return chars.length >= 2 && chars.every((char) => /[\p{Script=Han}，。；：！？、（）《》【】「」『』]/u.test(char))
 }
 
 function hasFile(event: DragEvent) {
@@ -127,9 +123,8 @@ export default function App() {
   const activeEdit = draft?.edits.find((edit) => edit.id === selected)
   const useSavedSelection = activeEdit && sameMarks(activeEdit.marks, marks) && (activeEdit.orientation ?? 'horizontal') === orientation
   const replacement = text.trim()
-  const characterLayout = useSavedSelection && fullWidthChinese(replacement) &&
-    [activeEdit.original, activeEdit.layout_reference].some((reference) =>
-      reference && fullWidthChinese(reference) && Array.from(reference).length === Array.from(replacement).length)
+  const characterLayout = useSavedSelection && usesOriginalPositions(activeEdit.original, replacement)
+  const preservePositions = layout?.mode !== 'natural'
   const busy = uploading !== null || readingResult || (!taskError && (task?.status === 'queued' || task?.status === 'processing'))
   const locked = busy || loadingImage || !hydrated
   const textCount = Array.from(text).length
@@ -139,7 +134,8 @@ export default function App() {
     (!draftsEnabled || !draftId || draft))
   const matchesAppliedEdit = Boolean(resultUrl && activeEdit && useSavedSelection && !activeEdit.layout_refresh_available &&
     activeEdit.text === text.trim() && activeEdit.font?.family === font?.family && activeEdit.font?.weight === font?.weight &&
-    activeEdit.layout?.spacing === layout?.spacing && Boolean(activeEdit.texture) === texture &&
+    (activeEdit.layout?.spacing ?? 0) === (layout?.spacing ?? 0) && activeEdit.layout?.mode === layout?.mode &&
+    Boolean(activeEdit.texture) === texture &&
     (font || activeEdit.providers.render === providers?.render))
   const advancedType = health?.typography === true
   const textStyle = { font, layout, orientation: advancedType ? orientation : undefined, texture: advancedType ? texture : undefined }
@@ -684,15 +680,15 @@ export default function App() {
                   <option value="clockwise">横排顺时针转 90°</option>
                   <option value="counterclockwise">横排逆时针转 90°</option>
                 </select></label>}
-                <label className="layout-toggle"><input type="checkbox" checked={Boolean(layout)} disabled={locked} onChange={(event) => {
+                <label className="layout-toggle"><input type="checkbox" checked={preservePositions} disabled={locked} onChange={(event) => {
                   clearTaskFeedback()
-                  setLayout(event.currentTarget.checked ? { spacing: 0 } : undefined)
+                  setLayout(event.currentTarget.checked ? { spacing: 0 } : { spacing: 0, mode: 'natural' })
                 }} />按原图字位排版</label>
-                {layout && (orientation === 'vertical' || characterLayout ? <label className="layout-spacing">
-                  字距微调 <input type="range" aria-label="字距微调" min="-8" max="8" value={layout.spacing} disabled={locked} onChange={(event) => {
+                {preservePositions && (orientation === 'vertical' || characterLayout ? <label className="layout-spacing">
+                  字距微调 <input type="range" aria-label="字距微调" min="-8" max="8" value={layout?.spacing ?? 0} disabled={locked} onChange={(event) => {
                     clearTaskFeedback()
                     setLayout({ spacing: event.currentTarget.valueAsNumber })
-                  }} /><span>{layout.spacing > 0 ? '+' : ''}{layout.spacing} px</span>
+                  }} /><span>{(layout?.spacing ?? 0) > 0 ? '+' : ''}{layout?.spacing ?? 0} px</span>
                 </label> : <p>选区内的中文与新文案字数相同时可微调字距。混排按字体自然字距。</p>)}
               </div>}
               {advancedType && image && <TextureControls key={activeEdit ? `${activeEdit.id}:${draft?.version}` : 'new-edit'}

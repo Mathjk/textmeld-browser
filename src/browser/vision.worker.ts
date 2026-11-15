@@ -2,6 +2,7 @@ import cv from '@techstark/opencv-js'
 import type { InferenceSession } from 'onnxruntime-web/wasm'
 import type { Box, Letter, Output, Prepared, RenderOptions, Typeface, WorkerActions } from './types'
 import type { TextOrientation } from '../drafts'
+import { hanReference, measuredSlots, protectBoundaryPunctuation, usesOriginalPositions } from './spacing'
 
 type Point = { x: number; y: number }
 type Quad = [Point, Point, Point, Point]
@@ -486,6 +487,11 @@ async function prepare({ image, mask, orientation }: WorkerActions['prepare']): 
       return offset >= start && offset < end ? 255 : 0
     })
     const extracted = inkFrom(flat, area)
+    if (!vertical && protectBoundaryPunctuation(letters, extracted.core, extracted.erase, flatMask.data,
+      plane.width, plane.height, extracted.ink.height)) {
+      extracted.ink = bounding(extracted.core, plane.width, plane.height)
+    }
+    const glyphSlots = vertical ? [] : measuredSlots(letters, extracted.core, plane.width, plane.height, extracted.ink.height)
     const rgb = new cv.Mat(), filled = new cv.Mat(), restored = new cv.Mat()
     const erase = cv.matFromArray(plane.height, plane.width, cv.CV_8UC1, extracted.erase)
     let background: Blob
@@ -500,7 +506,7 @@ async function prepare({ image, mask, orientation }: WorkerActions['prepare']): 
     const physical = quad.map((p) => orientation === 'clockwise' ? { x: crop.width - p.y, y: p.x }
       : orientation === 'counterclockwise' ? { x: p.y, y: crop.height - p.x } : p) as Quad
     return { crop, originalImage, background, erase: extracted.erase, matrix: matrix(dst, physical), plane,
-      ink: extracted.ink, color: extracted.color, original, letters, orientation,
+      ink: extracted.ink, color: extracted.color, original, letters, glyphSlots, orientation,
       candidates: recommend(letters, extracted.core, plane.width, plane.height, vertical), softness: extracted.softness }
   } finally {
     color.delete(); allowed.delete(); flat?.delete(); flatMask?.delete()
@@ -547,22 +553,49 @@ function typeGlyphs(draw: OffscreenCanvasRenderingContext2D, prepared: Prepared,
   const size = Math.max(4, ink.height ** 2 / Math.max(1, metrics.actualBoundingBoxAscent + metrics.actualBoundingBoxDescent))
   const fitted = measure(size)
   const baseline = ink.y + ink.height - fitted.actualBoundingBoxDescent
-  const original = Array.from(prepared.original.replace(/[\p{P}]+$/u, ''))
-  const equalChinese = options.spacing !== undefined && characters.length >= 2 && original.length === characters.length &&
-    [...original, ...characters].every((char) => /\p{Script=Han}/u.test(char))
-  if (equalChinese) {
-    draw.textAlign = 'center'
-    const max = Math.min(prepared.plane.width, ink.x + ink.width + 3)
-    const min = Math.max(0, ink.x - 3)
-    const designWidth = Math.min(ink.width + 6, Math.max(ink.width * 0.6, ink.width + options.spacing! * (characters.length - 1)))
-    const step = designWidth / characters.length
-    const center = ink.x + ink.width / 2
-    for (let n = 0; n < characters.length; n++) {
-      const at = Math.max(min + step / 2, Math.min(max - step / 2, center + (n - (characters.length - 1) / 2) * step))
-      draw.fillText(characters[n], at, baseline, Math.max(1, step - 1))
-    }
+  if (options.spacing !== undefined && usesOriginalPositions(prepared.original, text)) {
+    spacedGlyphs(draw, prepared, characters, baseline, options.spacing)
   } else {
     draw.fillText(text, ink.x + Math.max(0, fitted.actualBoundingBoxLeft), baseline, Math.max(1, ink.width))
+  }
+}
+
+function spacedGlyphs(draw: OffscreenCanvasRenderingContext2D, prepared: Prepared, characters: string[],
+  baseline: number, spacing: number) {
+  const { ink, glyphSlots } = prepared
+  const count = characters.length
+  const metrics = (text: string) => {
+    const measured = draw.measureText(text)
+    return { left: measured.actualBoundingBoxLeft, right: measured.actualBoundingBoxRight }
+  }
+  draw.textAlign = 'left'
+  const original = [...hanReference(prepared.original)!]
+  const edge = (char: string) => {
+    const bounds = metrics(char)
+    return Math.min(ink.width / count * 0.53, (bounds.left + bounds.right) / 2)
+  }
+  const start = ink.x + edge(original[0])
+  const end = ink.x + ink.width - edge(original[count - 1])
+  const anchors = glyphSlots?.length === count ? glyphSlots.map(({ left, right }) => (left + right) / 2)
+    : characters.map((_, n) => start + (end - start) * n / (count - 1))
+  const step = Math.min(...anchors.slice(1).map((value, i) => value - anchors[i]))
+  const min = Math.max(0, ink.x - 3)
+  const max = Math.min(prepared.plane.width, ink.x + ink.width + 3)
+  const expansion = Math.min(8, 2 * Math.min(ink.x - min, max - ink.x - ink.width) / (count - 1))
+  const adjustment = Math.max(-step / 4, Math.min(expansion, spacing))
+  const centers = anchors.map((value, i) => value + (i - (count - 1) / 2) * adjustment)
+  for (let n = 0; n < count; n++) {
+    const at = centers[n]
+    const leftEdge = n > 0 ? (centers[n - 1] + at) / 2 + 0.5 : min
+    const rightEdge = n < count - 1 ? (centers[n + 1] + at) / 2 - 0.5 : max
+    const bounds = metrics(characters[n])
+    const width = Math.max(1, bounds.left + bounds.right)
+    const slot = Math.max(1, 2 * Math.min(at - leftEdge, rightEdge - at))
+    draw.save()
+    draw.translate(at, baseline)
+    draw.scale(Math.min(1, slot / width), 1)
+    draw.fillText(characters[n], (bounds.left - bounds.right) / 2, 0)
+    draw.restore()
   }
 }
 

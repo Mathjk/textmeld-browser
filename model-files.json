@@ -1,0 +1,18 @@
+{
+  "PP-OCRv6_det_small.onnx": {
+    "size": 9929594,
+    "sha256": "090f04abcd9d9a7498bc4ebf677e4cb9bdce1fe4197ddb7e529f1ef44e1ff94f"
+  },
+  "PP-OCRv6_rec_small.onnx": {
+    "size": 21234383,
+    "sha256": "6f327246b50388f3c176ae304bd95767ea6dc0c9ae92153ef8cbe210b3c14884"
+  },
+  "alphabet.json": {
+    "size": 131082,
+    "sha256": "e6948b0b16c8d2c1255403b884fb9b3ecc3e5dea0ddafdfebe7276ef41520a08"
+  },
+  "glyph-index.json": {
+    "size": 841497,
+    "sha256": "91fe41ca0bf830c6be0ccf64034742f84cb7af9061e18f6392b1aa81c77f5fa0"
+  }
+}
